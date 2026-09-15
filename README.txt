@@ -1,0 +1,1 @@
+نسخه V4: تمام c.lastrowid به cursor.lastrowid اصلاح شده؛ bot.py با compile بررسی شده است. فایل bot.py را جایگزین نسخه فعلی کنید.

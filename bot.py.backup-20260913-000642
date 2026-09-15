@@ -1,0 +1,238 @@
+import os, sqlite3, secrets, string, shutil, subprocess
+from pathlib import Path
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+
+BASE=Path(__file__).resolve().parent
+DB=BASE/"data"/"eleven_store.db"
+INSTANCES=BASE/"instances"
+TEMPLATE=BASE/"customer_template"
+load_dotenv(BASE/".env")
+BOT_TOKEN=os.getenv("BOT_TOKEN","").strip()
+OWNER_ID=int(os.getenv("OWNER_ID","0") or 0)
+MAX_TEST_GB=5
+MAX_TEST_HOURS=24
+
+PLANS={
+    "1m": {"name":"ربات فروش پنل ۱ ماهه","price":250_000,"duration":30},
+    "2m": {"name":"ربات فروش پنل ۲ ماهه","price":500_000,"duration":60},
+    "3m": {"name":"ربات فروش پنل ۳ ماهه","price":699_000,"duration":90},
+}
+
+def conn():
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+def now(): return datetime.now()
+def init_db():
+    c=conn()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,telegram_id INTEGER UNIQUE,username TEXT,balance INTEGER DEFAULT 0,trial_used INTEGER DEFAULT 0,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS bots(id INTEGER PRIMARY KEY,user_id INTEGER,bot_username TEXT,bot_token TEXT,admin_id INTEGER,plan TEXT,plan_price INTEGER DEFAULT 0,expires_at TEXT,status TEXT,instance_path TEXT,last_backup TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY,key TEXT UNIQUE,name TEXT,price INTEGER,duration_days INTEGER,active INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS trials(id INTEGER PRIMARY KEY,user_id INTEGER UNIQUE,username TEXT,password TEXT,panel_url TEXT,gb REAL,hours REAL,expires_at TEXT,status TEXT,created_at TEXT,deleted_at TEXT);
+    CREATE TABLE IF NOT EXISTS test_settings(id INTEGER PRIMARY KEY CHECK(id=1),gb REAL DEFAULT 1,hours REAL DEFAULT 6,max_concurrent INTEGER DEFAULT 5);
+    CREATE TABLE IF NOT EXISTS backups(id INTEGER PRIMARY KEY,user_id INTEGER,bot_id INTEGER,path TEXT,kind TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY,user_id INTEGER,bot_id INTEGER,plan TEXT,amount INTEGER,kind TEXT,status TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,user_id INTEGER,message TEXT,status TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS referrals(user_id INTEGER PRIMARY KEY,invited_count INTEGER DEFAULT 0,earned INTEGER DEFAULT 0);
+    INSERT OR IGNORE INTO test_settings(id) VALUES(1);
+    INSERT OR IGNORE INTO products(key,name,price,duration_days) VALUES
+      ('1m','ربات فروش پنل ۱ ماهه',250000,30),
+      ('2m','ربات فروش پنل ۲ ماهه',500000,60),
+      ('3m','ربات فروش پنل ۳ ماهه',699000,90);
+    
+    """);
+    try: c.execute("ALTER TABLE bots ADD COLUMN plan_price INTEGER DEFAULT 0")
+    except sqlite3.OperationalError: pass
+    c.commit(); c.close()
+def user(u):
+    c=conn(); c.execute("""INSERT INTO users(telegram_id,username,created_at) VALUES(?,?,?)
+    ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username""",(u.id,u.username or "",now().isoformat()))
+    c.execute("INSERT OR IGNORE INTO referrals(user_id) SELECT id FROM users WHERE telegram_id=?",(u.id,))
+    c.commit(); r=c.execute("SELECT * FROM users WHERE telegram_id=?",(u.id,)).fetchone(); c.close(); return r
+def button_style(text):
+    if text.startswith("🟢") or text.startswith("✅") or text.startswith("➕"):
+        return "success"
+    if text.startswith("🔴") or text.startswith("🗑") or text.startswith("❌"):
+        return "danger"
+    if text.startswith(("🔵","🧪","⚙️","🟡","👑","💳","📦","💾","📥","🔀","📅","👤","🔑","🛒","📊")):
+        return "primary"
+    return None
+
+def markup(rows):
+    out=[]
+    for row in rows:
+        rr=[]
+        for item in row:
+            text,data=item[:2]
+            style=item[2] if len(item)>2 else button_style(text)
+            kwargs={"callback_data":data}
+            if style: kwargs["style"]=style
+            rr.append(InlineKeyboardButton(text,**kwargs))
+        out.append(rr)
+    return InlineKeyboardMarkup(out)
+def home(uid):
+    rows=[[("🟢 🤖 ساخت ربات","build"),("🔵 💰 کیف پول","wallet")],
+          [("🟡 ⚙️ مدیریت ربات","manage"),("🔵 🧪 تست پنل","trial")],
+          [("🟢 👥 زیرمجموعه‌گیری","ref"),("🆘 پشتیبانی","support")]]
+    if uid==OWNER_ID: rows.append([("👑 پنل ادمین","admin")])
+    return markup(rows)
+async def start(update,ctx):
+    user(update.effective_user)
+    await update.message.reply_text("👋 به Eleven Store خوش اومدی!\n\nاز منوی زیر می‌تونی رباتت رو بسازی، مدیریت کنی، تست بگیری و کیف پولت رو مدیریت کنی.",reply_markup=home(update.effective_user.id))
+async def back(q): await q.edit_message_text("🏠 منوی اصلی",reply_markup=home(q.from_user.id))
+async def build(q,ctx):
+    ctx.user_data.clear(); ctx.user_data["state"]="plan"; await q.edit_message_text(
+        "🤖 ساخت ربات\n\n📦 پلن موردنظرت رو انتخاب کن:",reply_markup=markup([
+        [("🟢 ربات فروش پنل ۱ ماهه — ۲۵۰,۰۰۰ تومان","plan:1m")],
+        [("🟢 ربات فروش پنل ۲ ماهه — ۵۰۰,۰۰۰ تومان","plan:2m")],
+        [("🟢 ربات فروش پنل ۳ ماهه — ۶۹۹,۰۰۰ تومان","plan:3m")],
+        [("🔙 بازگشت","back")]]))
+async def trial(q,ctx):
+    u=user(q.from_user); c=conn(); old=c.execute("SELECT 1 FROM trials WHERE user_id=?",(u["id"],)).fetchone()
+    s=c.execute("SELECT * FROM test_settings WHERE id=1").fetchone()
+    active=c.execute("SELECT COUNT(*) n FROM trials WHERE status='active' AND expires_at>?",(now().isoformat(),)).fetchone()["n"]; c.close()
+    if old or u["trial_used"]:
+        await q.edit_message_text("🚫 این اکانت قبلاً تست دریافت کرده است.\n\nهر کاربر فقط یک بار می‌تواند تست بگیرد.",reply_markup=markup([[("🔙 بازگشت","back")]])); return
+    if active>=s["max_concurrent"]:
+        await q.edit_message_text("⏳ ظرفیت تست‌های همزمان تکمیل شده.\nلطفاً بعداً دوباره امتحان کن.",reply_markup=markup([[("🔙 بازگشت","back")]])); return
+    gb=min(s["gb"],MAX_TEST_GB); h=min(s["hours"],MAX_TEST_HOURS)
+    ctx.user_data.update(state="trial_confirm",trial_gb=gb,trial_hours=h)
+    await q.edit_message_text(f"🧪 تست پنل\n\n📦 حجم: {gb:g} GB\n⏱ مدت: {h:g} ساعت\n\n⚠️ بعد از پایان تست، حساب تست از سیستم حذف می‌شود.\n\nآماده‌ای؟",reply_markup=markup([[("🟢 ساخت تست","trial:create"),("🔙 بازگشت","back")]]))
+def cred(n): return ''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(n))
+async def create_trial(q,ctx):
+    u=user(q.from_user); gb=ctx.user_data.get("trial_gb",1); h=ctx.user_data.get("trial_hours",6); exp=now()+timedelta(hours=h)
+    un="ep_test_"+cred(7); pw=cred(12)+"!"; url=os.getenv("TEST_PANEL_URL","https://example.com:8000")
+    c=conn(); c.execute("UPDATE users SET trial_used=1 WHERE id=?",(u["id"],)); c.execute(
+        "INSERT INTO trials(user_id,username,password,panel_url,gb,hours,expires_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (u["id"],un,pw,url,gb,h,exp.isoformat(),"active",now().isoformat())); c.commit(); c.close(); ctx.user_data.clear()
+    await q.edit_message_text(f"✅ تست پنل آماده شد!\n\n🌐 آدرس پنل:\n{url}\n\n👤 Username:\n{un}\n\n🔑 Password:\n{pw}\n\n📦 حجم: {gb:g} GB\n⏱ اعتبار: {h:g} ساعت\n📅 انقضا: {exp.strftime('%Y-%m-%d %H:%M')}\n\n🗑 بعد از پایان تست، حساب تست حذف می‌شود.",reply_markup=markup([[("🔙 بازگشت","back")]]))
+async def wallet(q,ctx):
+    u=user(q.from_user); await q.edit_message_text(f"💰 کیف پول\n\n💵 موجودی: {u['balance']:,} تومان\n\nاز گزینه‌های زیر استفاده کن:",reply_markup=markup([
+        [("➕ افزایش موجودی","topup"),("💳 تراکنش‌ها","transactions")],[("📜 تاریخچه","history")],[("🔙 بازگشت","back")]]))
+async def manage(q,ctx):
+    u=user(q.from_user); c=conn(); bs=c.execute("SELECT * FROM bots WHERE user_id=? ORDER BY id DESC",(u["id"],)).fetchall(); c.close()
+    if not bs: await q.edit_message_text("⚙️ هنوز رباتی نداری.\n\nاول از «🤖 ساخت ربات» شروع کن.",reply_markup=markup([[("🤖 ساخت ربات","build"),("🔙 بازگشت","back")]])); return
+    rows=[[(f"🤖 {b['bot_username'] or 'ربات'}",f"bot:{b['id']}")] for b in bs[:20]]+[ [("🔙 بازگشت","back")] ]
+    await q.edit_message_text("⚙️ مدیریت ربات\n\nربات موردنظر را انتخاب کن:",reply_markup=markup(rows))
+async def bot_info(q,ctx,bid):
+    c=conn(); b=c.execute("SELECT * FROM bots WHERE id=?",(bid,)).fetchone(); c.close()
+    if not b: await q.edit_message_text("❌ ربات پیدا نشد.",reply_markup=markup([[("🔙 بازگشت","manage")]])); return
+    await q.edit_message_text(f"🤖 اطلاعات ربات\n\n🤖 Username: {b['bot_username'] or 'در انتظار اتصال'}\n🟢 وضعیت: {b['status']}\n📦 پلن: {b['plan'] or '-'}\n🆔 Admin ID: {b['admin_id']}\n📅 انقضا: {b['expires_at'] or '-'}\n💾 آخرین Backup: {b['last_backup'] or 'هنوز گرفته نشده'}",reply_markup=markup([
+        [("👤 تغییر Admin ID",f"chgadmin:{bid}"),("🔑 تغییر Token",f"chgtoken:{bid}")],
+        [("💾 دریافت Backup",f"backup:{bid}"),("📥 Import Backup",f"import:{bid}")],
+        [("🔀 انتقال ربات",f"transfer:{bid}"),("📦 تغییر پلن",f"changeplan:{bid}")],
+        [("📅 تمدید ربات",f"renew:{bid}"),("🔴 حذف ربات",f"delete:{bid}")],
+        [("🔙 بازگشت","manage")]]))
+async def cb(update,ctx):
+    q=update.callback_query; await q.answer(); d=q.data
+    if d=="back": return await back(q)
+    if d=="build": return await build(q,ctx)
+    if d.startswith("plan:"):
+        key=d.split(":",1)[1]; plan=PLANS[key]; ctx.user_data.update(state="admin_choice",plan_key=key,plan=plan["name"],plan_price=plan["price"])
+        return await q.edit_message_text(f"📦 پلن انتخابی: {plan['name']}\n💰 قیمت: {plan['price']:,} تومان\n\n🆔 Admin ID را مشخص کن:",reply_markup=markup([
+            [("🟢 همین اکانت ادمین باشه","admin:self")],
+            [("🔵 اکانت دیگه‌ای می‌خوام","admin:other")],[("🔙 بازگشت","build")]]))
+    if d=="admin:self":
+        ctx.user_data.update(admin_id=q.from_user.id,state="token")
+        return await q.edit_message_text(f"🟢 Admin ID ثبت شد.\n\n🆔 {q.from_user.id}\n\n🔑 حالا Bot Token را ارسال کن.\n\n📌 از @BotFather → /mybots → انتخاب ربات → API Token.\n\nمثال فیک:\n123456789:AAExampleToken",reply_markup=markup([[("🔙 بازگشت","build")]]))
+    if d=="admin:other":
+        ctx.user_data["state"]="admin_other"; return await q.edit_message_text(
+            "🆔 Admin ID اکانت دیگر\n\nآیدی عددی اکانت موردنظر را ارسال کن.\n\n💡 برای گرفتن ID، با همان اکانت یک ربات دریافت Telegram ID را Start کن و عدد نمایش‌داده‌شده را اینجا بفرست.\n\nمثال فیک:\n728451963",reply_markup=markup([[("🔙 بازگشت","build")]]))
+    if d=="trial": return await trial(q,ctx)
+    if d=="trial:create": return await create_trial(q,ctx)
+    if d=="wallet": return await wallet(q,ctx)
+    if d=="manage": return await manage(q,ctx)
+    if d.startswith("bot:"): return await bot_info(q,ctx,int(d.split(":")[1]))
+    if d=="ref":
+        u=user(q.from_user); c=conn(); r=c.execute("SELECT * FROM referrals WHERE user_id=?",(u["id"],)).fetchone(); c.close()
+        me=await ctx.bot.get_me(); return await q.edit_message_text(f"👥 زیرمجموعه‌گیری\n\n🔗 لینک دعوت:\nhttps://t.me/{me.username}?start=ref_{u['telegram_id']}\n\n👥 دعوت‌شده‌ها: {r['invited_count']}\n🎁 درآمد: {r['earned']:,} تومان",reply_markup=markup([[("🔙 بازگشت","back")]]))
+    if d=="support":
+        ctx.user_data["state"]="support"; return await q.edit_message_text("🆘 پشتیبانی\n\nمشکل یا سوالت رو همینجا بنویس تا برای ادمین ارسال بشه.",reply_markup=markup([[("🔙 بازگشت","back")]]))
+    if d=="admin":
+        if q.from_user.id!=OWNER_ID: return await q.answer("دسترسی ندارید",show_alert=True)
+        c=conn(); vals=[c.execute(x).fetchone()["n"] for x in ["SELECT COUNT(*) n FROM users","SELECT COUNT(*) n FROM bots","SELECT COUNT(*) n FROM trials","SELECT COUNT(*) n FROM orders"]]; c.close()
+        return await q.edit_message_text(f"👑 پنل ادمین\n\n👥 کاربران: {vals[0]}\n🤖 ربات‌ها: {vals[1]}\n🧪 تست‌ها: {vals[2]}\n📦 سفارش‌ها: {vals[3]}",reply_markup=markup([[("🛒 محصولات و پلن‌ها","admin_products")],[("🧪 تنظیمات تست","admin_test")],[("🔙 بازگشت","back")]]))
+    if d=="admin_products":
+        if q.from_user.id!=OWNER_ID: return await q.answer("دسترسی ندارید",show_alert=True)
+        text="🛒 محصولات و پلن‌ها\n\n" + "\n".join([f"{i}. {v['name']}\n   💰 {v['price']:,} تومان | ⏱ {v['duration']} روز" for i,v in enumerate(PLANS.values(),1)])
+        return await q.edit_message_text(text,reply_markup=markup([[('🟢 فعال','admin_products')],[('🔙 بازگشت','admin')]]))
+    if d=="admin_test":
+        if q.from_user.id!=OWNER_ID: return await q.answer("دسترسی ندارید",show_alert=True)
+        c=conn(); s=c.execute("SELECT * FROM test_settings WHERE id=1").fetchone(); c.close()
+        return await q.edit_message_text(f"🧪 تنظیمات تست\n\n📦 حجم: {s['gb']:g} GB\n⏱ مدت: {s['hours']:g} ساعت\n👥 تست همزمان: {s['max_concurrent']}\n\n⚠️ سقف: 5GB / 24 ساعت",reply_markup=markup([
+            [("📦 تغییر حجم","set:gb"),("⏱ تغییر زمان","set:hours")],[("👥 تغییر همزمان","set:concurrent")],[("🔙 بازگشت","admin")]]))
+    if d.startswith("set:"):
+        if q.from_user.id!=OWNER_ID: return await q.answer("دسترسی ندارید",show_alert=True)
+        ctx.user_data["state"]="set_"+d.split(":")[1]; return await q.edit_message_text("✏️ مقدار جدید را ارسال کن.\n\nمثال: 2")
+    if d.startswith(("chgadmin:","chgtoken:","backup:","import:","transfer:","changeplan:","renew:","delete:")):
+        action,bid=d.split(":"); ctx.user_data.update(state=action,bid=int(bid))
+        if action=="chgadmin": msg="👤 Admin ID جدید را ارسال کن.\n\nفقط آیدی عددی اکانت دیگر را وارد کن.\nمثال فیک: 728451963"
+        elif action=="chgtoken": msg="🔑 Bot Token جدید را ارسال کن.\n\n📌 Token را از @BotFather دریافت کن."
+        elif action=="backup": msg="💾 Backup\n\nدر نسخه نهایی Backup به‌صورت SQL ساخته و برایت ارسال می‌شود."
+        elif action=="import": msg="📥 Import Backup\n\nفایل SQL بکاپ را ارسال کن تا اطلاعات ربات بازیابی شود."
+        elif action=="transfer": msg="🔀 انتقال ربات\n\nAdmin ID عددی مالک جدید را ارسال کن."
+        elif action=="changeplan": msg="📦 پلن جدید را ارسال کن.\n\nپلن مشتری قابل تغییر است."
+        elif action=="renew": msg="📅 مدت تمدید را ارسال کن.\n\nمثال: 30 روز"
+        else: msg="🔴 حذف ربات\n\nقبل از حذف، Backup نهایی گرفته می‌شود و سپس Instance حذف خواهد شد.\n\nبرای تأیید، «حذف» را ارسال کن."
+        return await q.edit_message_text(msg,reply_markup=markup([[("🔙 بازگشت","manage")]]))
+async def text(update,ctx):
+    state=ctx.user_data.get("state"); t=(update.message.text or "").strip(); u=user(update.effective_user)
+    if state=="admin_other":
+        if not t.isdigit(): return await update.message.reply_text("❌ Admin ID باید فقط عدد باشد.\nمثال فیک: 728451963")
+        ctx.user_data.update(admin_id=int(t),state="token"); return await update.message.reply_text("🟢 Admin ID دریافت شد.\n\n🔑 Bot Token را از @BotFather ارسال کن.\n\nمثال فیک:\n123456789:AAExampleToken")
+    if state=="token":
+        if ":" not in t: return await update.message.reply_text("❌ Bot Token معتبر به نظر نمی‌رسد.\nاز @BotFather → /mybots → API Token دوباره کپی کن.")
+        ctx.user_data["bot_token"]=t; ctx.user_data["state"]="confirm"
+        return await update.message.reply_text(f"🔍 بررسی اطلاعات\n\n📦 پلن: {ctx.user_data.get('plan')}\n🆔 Admin ID: {ctx.user_data.get('admin_id')}\n🔑 Bot Token: دریافت شد ✅\n\nاطلاعات درسته؟",reply_markup=markup([[("🟢 تأیید و راه‌اندازی","provision"),("🔴 لغو","back")]]))
+    if state.startswith("set_") and update.effective_user.id==OWNER_ID:
+        try: v=float(t)
+        except: return await update.message.reply_text("❌ فقط عدد ارسال کن.")
+        field=state[4:]; v=min(v,MAX_TEST_GB) if field=="gb" else min(v,MAX_TEST_HOURS) if field=="hours" else max(1,int(v))
+        c=conn(); c.execute(f"UPDATE test_settings SET {field}=? WHERE id=1",(v,)); c.commit(); c.close(); ctx.user_data.clear()
+        return await update.message.reply_text("✅ تنظیم تست ذخیره شد.",reply_markup=home(OWNER_ID))
+    if state=="support":
+        c=conn(); c.execute("INSERT INTO tickets(user_id,message,status,created_at) VALUES(?,?,?,?)",(u["id"],t,"open",now().isoformat())); c.commit(); c.close(); ctx.user_data.clear()
+        return await update.message.reply_text("✅ پیام برای پشتیبانی ارسال شد.",reply_markup=home(update.effective_user.id))
+    if state=="chgadmin":
+        if not t.isdigit(): return await update.message.reply_text("❌ فقط Admin ID عددی اکانت جدید را ارسال کن.")
+        c=conn(); c.execute("UPDATE bots SET admin_id=? WHERE id=? AND user_id=?",(int(t),ctx.user_data["bid"],u["id"])); c.commit(); c.close(); ctx.user_data.clear()
+        return await update.message.reply_text("✅ Admin ID با موفقیت تغییر کرد.",reply_markup=home(update.effective_user.id))
+    if state=="delete":
+        if t!="حذف": return await update.message.reply_text("❌ برای تأیید دقیقاً کلمه «حذف» را ارسال کن.")
+        c=conn(); b=c.execute("SELECT * FROM bots WHERE id=? AND user_id=?",(ctx.user_data["bid"],u["id"])).fetchone()
+        if b and b["instance_path"]: shutil.rmtree(b["instance_path"],ignore_errors=True)
+        c.execute("DELETE FROM bots WHERE id=? AND user_id=?",(ctx.user_data["bid"],u["id"])); c.commit(); c.close(); ctx.user_data.clear()
+        return await update.message.reply_text("🗑 ربات حذف شد.",reply_markup=home(update.effective_user.id))
+    if state=="transfer":
+        if not t.isdigit(): return await update.message.reply_text("❌ Admin ID عددی مالک جدید را ارسال کن.")
+        c=conn(); c.execute("UPDATE bots SET admin_id=? WHERE id=? AND user_id=?",(int(t),ctx.user_data["bid"],u["id"])); c.commit(); c.close(); ctx.user_data.clear()
+        return await update.message.reply_text("✅ انتقال ثبت شد.",reply_markup=home(update.effective_user.id))
+    if state=="confirm":
+        return
+async def provision_cb(update,ctx):
+    q=update.callback_query; await q.answer(); u=user(q.from_user); plan=ctx.user_data.get("plan","ربات فروش پنل ۱ ماهه"); price=ctx.user_data.get("plan_price",250000); aid=ctx.user_data.get("admin_id",q.from_user.id); tok=ctx.user_data.get("bot_token","")
+    p=INSTANCES/f"bot-{u['id']}-{int(now().timestamp())}"; p.mkdir(parents=True,exist_ok=True)
+    for f in TEMPLATE.iterdir():
+        if f.is_file(): shutil.copy2(f,p/f.name)
+    (p/".env").write_text(f"BOT_TOKEN={tok}\nOWNER_ID={aid}\nADMIN_ID={aid}\n",encoding="utf-8")
+    c=conn(); c.execute("INSERT INTO bots(user_id,bot_username,bot_token,admin_id,plan,plan_price,status,instance_path,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(u["id"],"@در انتظار اتصال",tok,aid,plan,price,"active",str(p),now().isoformat())); c.commit(); c.close(); ctx.user_data.clear()
+    await q.edit_message_text(f"🎉 ربات شما با موفقیت ثبت شد!\n\n🤖 Username: پس از اتصال نمایش داده می‌شود\n🟢 وضعیت: فعال\n📦 پلن: {plan}\n💰 قیمت: {price:,} تومان\n🆔 Admin ID: {aid}\n💾 Backup: آماده استفاده\n\n⚙️ از مدیریت ربات می‌توانی تنظیمات را تغییر بدهی.",reply_markup=markup([[("⚙️ مدیریت ربات","manage"),("🔙 بازگشت","back")]]))
+async def auto_job(ctx):
+    c=conn(); rows=c.execute("SELECT * FROM trials WHERE status='active' AND expires_at<=?",(now().isoformat(),)).fetchall()
+    for r in rows:
+        # اتصال به API واقعی PasarGuard در مرحله deploy انجام می‌شود؛ اینجا رکورد منقضی علامت می‌خورد.
+        c.execute("UPDATE trials SET status='deleted',deleted_at=? WHERE id=?",(now().isoformat(),r["id"]))
+    c.commit(); c.close()
+def main():
+    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN در .env تنظیم نشده است.")
+    init_db(); app=Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CallbackQueryHandler(provision_cb,pattern="^provision$"))
+    app.add_handler(CallbackQueryHandler(cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
+    app.job_queue.run_repeating(auto_job,60,10)
+    print("Eleven Store starting...")
+    app.run_polling(drop_pending_updates=True)
+if __name__=="__main__": main()

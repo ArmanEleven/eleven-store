@@ -1,0 +1,99 @@
+{
+  "format": "eleven-store-config-backup",
+  "version": 2,
+  "created_at": "2026-09-15T15:17:31.486999+00:00",
+  "bot": {
+    "license_key": "ELT-EABCCA7BCFD0",
+    "bot_username": "@ProElevenBot",
+    "plan_name": "تست رایگان ۲ ساعته",
+    "plan_key": "trial",
+    "price": 0,
+    "expires_at": "2026-09-15T17:15:54.102888+00:00"
+  },
+  "tables": {
+    "settings": [
+      {
+        "key": "order_summary",
+        "value": "1"
+      },
+      {
+        "key": "notify_admin_receipt",
+        "value": "1"
+      },
+      {
+        "key": "notify_report_receipt",
+        "value": "1"
+      },
+      {
+        "key": "bot_name",
+        "value": ""
+      },
+      {
+        "key": "welcome_text",
+        "value": ""
+      },
+      {
+        "key": "support_text",
+        "value": ""
+      },
+      {
+        "key": "support_username",
+        "value": ""
+      },
+      {
+        "key": "support_link",
+        "value": ""
+      },
+      {
+        "key": "min_wallet_topup",
+        "value": "100000"
+      },
+      {
+        "key": "service_renewal_enabled",
+        "value": "1"
+      },
+      {
+        "key": "service_volume_add_enabled",
+        "value": "1"
+      },
+      {
+        "key": "service_revoke_enabled",
+        "value": "1"
+      },
+      {
+        "key": "trial_enabled",
+        "value": "1"
+      },
+      {
+        "key": "trial_duration_minutes",
+        "value": "1440"
+      },
+      {
+        "key": "trial_volume_gb",
+        "value": "5"
+      }
+    ],
+    "products": [],
+    "custom_settings": [
+      {
+        "id": 1,
+        "enabled": 1,
+        "min_gb": 1,
+        "max_gb": 0,
+        "price_per_gb": 0,
+        "min_days": 1,
+        "max_days": 0,
+        "price_per_month": 0,
+        "price_limited_unlimited": 0,
+        "price_per_day": 0,
+        "ask_duration": 1,
+        "default_days": 30,
+        "users_enabled": 0,
+        "min_users": 1,
+        "max_users": 0,
+        "price_per_user": 0
+      }
+    ],
+    "payment_methods": []
+  }
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Eleven Store Mini App API
+After=network.target
+
+[Service]
+Type=simple
+User=eleven
+WorkingDirectory=/opt/eleven-store-bot
+ExecStart=/opt/eleven-store-bot/.venv/bin/uvicorn webapp:app --host 127.0.0.1 --port 8088
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/eleven-store-bot/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1 @@
+Eleven Store token belongs only in the root .env. Customer bot tokens are written automatically to each instances/<bot>/ .env. Never copy the Store token into an instance.\n
