@@ -6,3 +6,10 @@ database/app.db
 *.db
 *.log
 instance.pid
+
+# Runtime and customer instance secrets
+instances/*/.env
+instances/*/instance.pid
+instances/*/runtime.log
+customer_template/.env
+data/
