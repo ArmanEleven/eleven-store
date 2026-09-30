@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/eleven-store-bot
-ExecStart=/opt/eleven-store-bot/.venv/bin/python /opt/eleven-store-bot/main.py
+ExecStart=/opt/eleven-store-bot/.venv/bin/python /opt/eleven-store-bot/bot.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
